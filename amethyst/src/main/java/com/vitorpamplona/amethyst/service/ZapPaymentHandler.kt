@@ -221,42 +221,55 @@ class ZapPaymentHandler(
     }
 
     suspend fun assembleAllInvoices(
-        requests: List<ZapRequestReady>,
-        totalAmountMilliSats: Long,
-        message: String,
-        showErrorIfNoLnAddress: Boolean,
-        forceProxy: (String) -> Boolean,
-        onError: (String, String, User?) -> Unit,
-        onProgress: (percent: Float) -> Unit,
-        context: Context,
-        onAllDone: suspend (List<Payable>) -> Unit,
-    ) {
-        var progressAllPayments = 0.00f
-        val totalWeight = requests.sumOf { it.inputSetup.weight }
+    invoices: List<Pair<ZapSplitSetup, SignAllZapRequestsReturn>>,
+    totalAmountMilliSats: Long,
+    message: String,
+    showErrorIfNoLnAddress: Boolean,
+    onError: (String, String) -> Unit,
+    onProgress: (percent: Float) -> Unit,
+    context: Context,
+    onAllDone: suspend (MutableMap<Pair<ZapSplitSetup, SignAllZapRequestsReturn>, AssembleInvoiceReturn>) -> Unit,
+) {
+    var progressAllPayments = 0.00f
+    val totalWeight = invoices.sumOf { it.first.weight }
+    val successfulInvoices = mutableMapOf<Pair<ZapSplitSetup, SignAllZapRequestsReturn>, AssembleInvoiceReturn>()
+    val failedAddresses = mutableListOf<ZapSplitSetup>()
 
-        collectSuccessfulOperations<ZapRequestReady, Payable>(
-            items = requests,
-            runRequestFor = { splitZapRequestPair: ZapRequestReady, onReady ->
-                assembleInvoice(
-                    splitSetup = splitZapRequestPair.inputSetup,
-                    nostrZapRequest = splitZapRequestPair.zapRequestJson,
-                    toUser = splitZapRequestPair.user,
-                    zapValue = calculateZapValue(totalAmountMilliSats, splitZapRequestPair.inputSetup.weight, totalWeight),
-                    message = message,
-                    showErrorIfNoLnAddress = showErrorIfNoLnAddress,
-                    forceProxy = forceProxy,
-                    onError = onError,
-                    onProgressStep = { percentStepForThisPayment ->
-                        progressAllPayments += percentStepForThisPayment / requests.size
-                        onProgress(progressAllPayments)
-                    },
-                    context = context,
-                    onReady = onReady,
-                )
-            },
-            onReady = onAllDone,
-        )
-    }
+    collectSuccessfulSigningOperations<Pair<ZapSplitSetup, SignAllZapRequestsReturn>, AssembleInvoiceReturn>(
+        operationsInput = invoices,
+        runRequestFor = { splitZapRequestPair: Pair<ZapSplitSetup, SignAllZapRequestsReturn>, onReady ->
+            assembleInvoice(
+                splitSetup = splitZapRequestPair.first,
+                nostrZapRequest = splitZapRequestPair.second.zapRequestJson,
+                zapValue = calculateZapValue(totalAmountMilliSats, splitZapRequestPair.first.weight, totalWeight),
+                message = message,
+                showErrorIfNoLnAddress = showErrorIfNoLnAddress,
+                onError = { title, msg ->
+                    failedAddresses.add(splitZapRequestPair.first)
+                    onError(title, msg)
+                    onReady(null)
+                },
+                onProgressStep = { percentStepForThisPayment ->
+                    progressAllPayments += percentStepForThisPayment / invoices.size
+                    onProgress(progressAllPayments)
+                },
+                context = context,
+                onSuccess = {
+                    onProgressStep(1 - progressAllPayments)
+                    successfulInvoices[splitZapRequestPair] = it
+                    onReady(it)
+                }
+            )
+        },
+        onReady = { 
+            // Calculate the total successful weight
+            val successfulWeight = successfulInvoices.keys.sumOf { it.first.weight }
+            // Adjust the main invoice amount
+            val adjustedAmountMilliSats = totalAmountMilliSats * (successfulWeight / totalWeight)
+            onAllDone(successfulInvoices.filterValues { it != null } as MutableMap<Pair<ZapSplitSetup, SignAllZapRequestsReturn>, AssembleInvoiceReturn>)
+        }
+    )
+}
 
     class Paid(
         payable: Payable,
@@ -310,73 +323,66 @@ class ZapPaymentHandler(
     }
 
     private fun assembleInvoice(
-        splitSetup: ZapSplitSetup,
-        nostrZapRequest: String?,
-        toUser: User?,
-        zapValue: Long,
-        message: String,
-        showErrorIfNoLnAddress: Boolean = true,
-        forceProxy: (String) -> Boolean,
-        onError: (String, String, User?) -> Unit,
-        onProgressStep: (percent: Float) -> Unit,
-        context: Context,
-        onReady: (Payable) -> Unit,
-    ) {
-        var progressThisPayment = 0.00f
+    splitSetup: ZapSplitSetup,
+    nostrZapRequest: String,
+    zapValue: Long,
+    message: String,
+    showErrorIfNoLnAddress: Boolean = true,
+    onError: (String, String) -> Unit,
+    onProgressStep: (percent: Float) -> Unit,
+    context: Context,
+    onReady: (AssembleInvoiceReturn?) -> Unit,
+) {
+    var progressThisPayment = 0.00f
 
-        val lud16 =
-            if (splitSetup.isLnAddress) {
-                splitSetup.lnAddressOrPubKeyHex
-            } else {
-                toUser?.info?.lnAddress()
-            }
-
-        if (lud16 != null) {
-            LightningAddressResolver()
-                .lnAddressInvoice(
-                    lnaddress = lud16,
-                    milliSats = zapValue,
-                    message = message,
-                    nostrRequest = nostrZapRequest,
-                    forceProxy = forceProxy,
-                    onError = { title, msg ->
-                        onError(title, msg, toUser)
-                    },
-                    onProgress = {
-                        val step = it - progressThisPayment
-                        progressThisPayment = it
-                        onProgressStep(step)
-                    },
-                    context = context,
-                    onSuccess = {
-                        onProgressStep(1 - progressThisPayment)
-                        onReady(
-                            Payable(
-                                info = splitSetup,
-                                user = toUser,
-                                amountMilliSats = zapValue,
-                                invoice = it,
-                            ),
-                        )
-                    },
-                )
+    var user: User? = null
+    val lud16 =
+        if (splitSetup.isLnAddress) {
+            splitSetup.lnAddressOrPubKeyHex
         } else {
-            if (showErrorIfNoLnAddress) {
-                onError(
-                    stringRes(
-                        context,
-                        R.string.missing_lud16,
-                    ),
-                    stringRes(
-                        context,
-                        R.string.user_x_does_not_have_a_lightning_address_setup_to_receive_sats,
-                        user?.toBestDisplayName() ?: splitSetup.lnAddressOrPubKeyHex,
-                    ),
-                    null,
-                )
-            }
+            user = LocalCache.getUserIfExists(splitSetup.lnAddressOrPubKeyHex)
+            user?.info?.lnAddress()
         }
+
+    if (lud16 != null) {
+        LightningAddressResolver()
+            .lnAddressInvoice(
+                lnaddress = lud16,
+                milliSats = zapValue,
+                message = message,
+                nostrRequest = nostrZapRequest,
+                onError = { title, message ->
+                    onError(title, message)
+                    onReady(null)
+                },
+                onProgress = {
+                    val step = it - progressThisPayment
+                    progressThisPayment = it
+                    onProgressStep(step)
+                },
+                context = context,
+                onSuccess = {
+                    onProgressStep(1 - progressThisPayment)
+                    onReady(AssembleInvoiceReturn(zapValue, it))
+                },
+            )
+    } else {
+        if (showErrorIfNoLnAddress) {
+            onError(
+                stringRes(
+                    context,
+                    R.string.missing_lud16,
+                ),
+                stringRes(
+                    context,
+                    R.string.user_x_does_not_have_a_lightning_address_setup_to_receive_sats,
+                    user?.toBestDisplayName() ?: splitSetup.lnAddressOrPubKeyHex,
+                ),
+            )
+        }
+        onReady(null)
     }
+}
 
     private fun prepareZapRequestIfNeeded(
         note: Note,
